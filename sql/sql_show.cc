@@ -7759,6 +7759,90 @@ ST_SCHEMA_TABLE *get_schema_table(enum enum_schema_tables schema_table_idx)
   return &schema_tables[schema_table_idx];
 }
 
+bool evaluate_schema_field_recursive(Item* item, const char* field_name)
+{
+  switch(item->type())
+  {
+    case Item::FIELD_ITEM:
+      {
+        Item_field* field= (Item_field *)item;
+        if (!strcasecmp(field->field_name.str, field_name))
+          return true;
+        else if (!strcasecmp(field->field_name.str, "*"))
+          return true;
+        else
+          return false;
+      }
+
+    case Item::FUNC_ITEM:
+      {
+        bool show_field= false;
+        Item_func* func= (Item_func *)item;
+        for (uint i= 0; i < func->argument_count(); i++)
+        {
+          show_field= show_field ||
+                      evaluate_schema_field_recursive(func->arguments()[i],
+                                                      field_name);
+          if (show_field)
+            return true;
+        }
+        return false;
+      }
+
+    case Item::COND_ITEM:
+      {
+        Item *tmp;
+        bool show_field= false;
+        Item_cond* cond= (Item_cond *)item;
+        List_iterator<Item> it(*(cond->argument_list()));
+        while ((tmp= it++))
+        {
+          show_field= show_field ||
+                      evaluate_schema_field_recursive(tmp, field_name);
+          if (show_field)
+            return true;
+        }
+        return false;
+      }
+
+    default:
+      return false;
+  }
+}
+
+bool field_can_be_used_in_query(THD* thd, ST_FIELD_INFO *field_info)
+{
+  if (thd->lex->select_lex.sj_nests.elements > 0 ||
+      thd->lex->select_lex.sj_subselects.elements > 0 ||
+      thd->lex->select_lex.nest_level > 0 ||
+      thd->lex->select_lex.group_list.elements > 0 ||
+      thd->lex->select_lex.order_list.elements > 0)
+    return true;
+
+  reg2 Item *item;
+  List_iterator<Item> it(thd->lex->select_lex.item_list);
+
+  /* select fields list check */
+  while ((item= it++))
+  {
+    if (evaluate_schema_field_recursive(item, field_info->field_name))
+      return true;
+  }
+
+  /* select fields where cond check */
+  if (thd->lex->select_lex.where &&
+      evaluate_schema_field_recursive(thd->lex->select_lex.where,
+                                      field_info->field_name))
+    return true;
+
+  /* select fields having cond check */
+  if (thd->lex->select_lex.having &&
+      evaluate_schema_field_recursive(thd->lex->select_lex.having,
+                                      field_info->field_name))
+    return true;
+
+  return false;
+}
 
 /**
   Create information_schema table using schema_table data.
@@ -7783,6 +7867,7 @@ ST_SCHEMA_TABLE *get_schema_table(enum enum_schema_tables schema_table_idx)
 
 TABLE *create_schema_table(THD *thd, TABLE_LIST *table_list)
 {
+  bool show_field= false;
   int field_count= 0;
   Item *item;
   TABLE *table;
@@ -7869,19 +7954,35 @@ TABLE *create_schema_table(THD *thd, TABLE_LIST *table_list)
     case MYSQL_TYPE_MEDIUM_BLOB:
     case MYSQL_TYPE_LONG_BLOB:
     case MYSQL_TYPE_BLOB:
-      if (!(item= new (mem_root)
-            Item_blob(thd, fields_info->field_name,
-                      fields_info->field_length)))
+
+      show_field= field_can_be_used_in_query(thd, fields_info);
+      if (show_field)
       {
-        DBUG_RETURN(0);
+        if (!(item= new (mem_root)
+              Item_blob(thd, fields_info->field_name,
+                        fields_info->field_length)))
+        {
+          DBUG_RETURN(0);
+        }
+      }
+      else
+      {
+        if (!(item= new (mem_root)
+              Item_empty_string(thd, "", 1, cs)))
+        {
+          DBUG_RETURN(0);
+        }
+        item->set_name(thd, fields_info->field_name,
+                       field_name_length, cs);
       }
       break;
     default:
       /* Don't let unimplemented types pass through. Could be a grave error. */
       DBUG_ASSERT(fields_info->field_type == MYSQL_TYPE_STRING);
 
+      show_field= field_can_be_used_in_query(thd, fields_info);
       if (!(item= new (mem_root)
-            Item_empty_string(thd, "", fields_info->field_length, cs)))
+            Item_empty_string(thd, "", show_field ? fields_info->field_length : 1, cs)))
       {
         DBUG_RETURN(0);
       }
